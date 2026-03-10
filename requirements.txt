@@ -1,0 +1,14 @@
+matminer
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+seaborn
+shap
+joblib
+pyarrow
+ase
+pymatgen
+xgboost
+catboost
