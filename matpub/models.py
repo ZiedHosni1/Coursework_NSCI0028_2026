@@ -566,16 +566,21 @@ def evaluate_regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict[s
     bias = float(np.mean(y_pred_np - y_true_np))
     smape = float(np.mean(2.0 * np.abs(y_pred_np - y_true_np) / (np.abs(y_true_np) + np.abs(y_pred_np) + 1e-12)))
 
+    n_obs = int(y_true_np.shape[0])
+    r2_val = float(r2_score(y_true_np, y_pred_np)) if n_obs >= 2 else float("nan")
+    explained_var = float(explained_variance_score(y_true_np, y_pred_np)) if n_obs >= 2 else float("nan")
+    max_err = float(max_error(y_true_np, y_pred_np)) if n_obs >= 1 else float("nan")
+
     metrics = {
-        "r2": float(r2_score(y_true_np, y_pred_np)),
+        "r2": r2_val,
         "rmse": rmse,
         "mse": float(mean_squared_error(y_true_np, y_pred_np)),
         "mae": mae,
         "medae": medae,
         "mape": float(mean_absolute_percentage_error(y_true_np, y_pred_np)),
         "smape": smape,
-        "explained_variance": float(explained_variance_score(y_true_np, y_pred_np)),
-        "max_error": float(max_error(y_true_np, y_pred_np)),
+        "explained_variance": explained_var,
+        "max_error": max_err,
         "bias": bias,
     }
 
@@ -1532,6 +1537,9 @@ def bayesian_correlated_ttest_comparison(
             )
 
     return pd.DataFrame(rows)
+
+
+
 
 
 

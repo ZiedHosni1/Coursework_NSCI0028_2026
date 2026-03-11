@@ -59,22 +59,61 @@ def conformal_quantile(scores: np.ndarray, alpha: float) -> float:
     return float(sorted_scores[rank - 1])
 
 
+def _as_2d_dense(matrix: Any) -> np.ndarray:
+    dense = matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix)
+    if dense.ndim == 1:
+        dense = dense.reshape(-1, 1)
+    return dense
+
+
 def reduce_matrix(matrix: Any, random_state: int, max_dim: int = 40) -> np.ndarray:
     if sparse.issparse(matrix):
-        n_features = matrix.shape[1]
+        n_samples, n_features = matrix.shape
         if n_features <= max_dim:
             return matrix.toarray()
-        n_comp = min(max_dim, max(2, n_features - 1))
+        max_allowed = min(n_samples, n_features)
+        if max_allowed <= 1:
+            return matrix.toarray()
+        n_comp = min(max_dim, max_allowed)
         svd = TruncatedSVD(n_components=n_comp, random_state=random_state)
         return svd.fit_transform(matrix)
 
-    dense = np.asarray(matrix)
+    dense = _as_2d_dense(matrix)
     if dense.shape[1] <= max_dim:
         return dense
 
-    pca = PCA(n_components=max_dim, random_state=random_state)
+    max_allowed = min(dense.shape[0], dense.shape[1])
+    if max_allowed <= 1:
+        return dense
+    n_comp = min(max_dim, max_allowed)
+    pca = PCA(n_components=n_comp, random_state=random_state)
     return pca.fit_transform(dense)
 
+
+def reduce_matrix_pair(
+    train_matrix: Any,
+    test_matrix: Any,
+    random_state: int,
+    max_dim: int = 40,
+) -> tuple[np.ndarray, np.ndarray]:
+    if sparse.issparse(train_matrix) or sparse.issparse(test_matrix):
+        train_sparse = train_matrix if sparse.issparse(train_matrix) else sparse.csr_matrix(train_matrix)
+        n_samples, n_features = train_sparse.shape
+        max_allowed = min(n_samples, n_features)
+        if max_allowed <= 1 or n_features <= max_dim:
+            return _as_2d_dense(train_matrix), _as_2d_dense(test_matrix)
+        n_comp = min(max_dim, max_allowed)
+        svd = TruncatedSVD(n_components=n_comp, random_state=random_state)
+        return svd.fit_transform(train_sparse), svd.transform(test_matrix)
+
+    train_dense = _as_2d_dense(train_matrix)
+    test_dense = _as_2d_dense(test_matrix)
+    max_allowed = min(train_dense.shape[0], train_dense.shape[1])
+    if max_allowed <= 1 or train_dense.shape[1] <= max_dim:
+        return train_dense, test_dense
+    n_comp = min(max_dim, max_allowed)
+    pca = PCA(n_components=n_comp, random_state=random_state)
+    return pca.fit_transform(train_dense), pca.transform(test_dense)
 
 
 def _encode_mixed_frame_for_embedding(frame: pd.DataFrame) -> pd.DataFrame:
@@ -895,8 +934,12 @@ def _compute_local_conformal_scales(
         pipe = _unwrap_pipeline(model)
         if hasattr(pipe, "named_steps") and "preprocessor" in pipe.named_steps:
             pre = pipe.named_steps["preprocessor"]
-            calib_repr = reduce_matrix(pre.transform(X_calib), random_state=42, max_dim=30)
-            test_repr = reduce_matrix(pre.transform(X_test), random_state=42, max_dim=30)
+            calib_repr, test_repr = reduce_matrix_pair(
+                pre.transform(X_calib),
+                pre.transform(X_test),
+                random_state=42,
+                max_dim=30,
+            )
         else:
             calib_repr = _encode_mixed_frame_for_embedding(X_calib).to_numpy(dtype=float)
             test_repr = _encode_mixed_frame_for_embedding(X_test).to_numpy(dtype=float)
@@ -1162,8 +1205,11 @@ def plot_feature_correlation_heatmap(
 
 
 def compute_mahalanobis(train_repr: np.ndarray, test_repr: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    train_repr = _as_2d_dense(train_repr)
+    test_repr = _as_2d_dense(test_repr)
     mu = np.mean(train_repr, axis=0)
-    cov = np.cov(train_repr, rowvar=False)
+    cov = np.atleast_2d(np.cov(train_repr, rowvar=False))
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
     cov += np.eye(cov.shape[0]) * 1e-8
     inv_cov = np.linalg.pinv(cov)
 
@@ -1235,8 +1281,12 @@ def run_outlier_analysis(
 ) -> pd.DataFrame:
     pipe = _unwrap_pipeline(model)
     pre: ColumnTransformer = pipe.named_steps["preprocessor"]
-    train_repr = reduce_matrix(pre.transform(X_train), random_state=random_state, max_dim=30)
-    test_repr = reduce_matrix(pre.transform(X_test), random_state=random_state, max_dim=30)
+    train_repr, test_repr = reduce_matrix_pair(
+        pre.transform(X_train),
+        pre.transform(X_test),
+        random_state=random_state,
+        max_dim=30,
+    )
 
     train_dist, test_dist, threshold = compute_mahalanobis(train_repr, test_repr)
     plot_mahalanobis_distribution(model_label, test_dist, threshold, out_dir / "mahalanobis_distribution.png")
@@ -1488,8 +1538,12 @@ def run_doa_suite(
 
     pipe = _unwrap_pipeline(model)
     pre: ColumnTransformer = pipe.named_steps["preprocessor"]
-    train_repr = reduce_matrix(pre.transform(X_train), random_state=random_state, max_dim=30)
-    test_repr = reduce_matrix(pre.transform(X_test), random_state=random_state, max_dim=30)
+    train_repr, test_repr = reduce_matrix_pair(
+        pre.transform(X_train),
+        pre.transform(X_test),
+        random_state=random_state,
+        max_dim=30,
+    )
 
     train_residual = np.abs(np.asarray(y_train) - np.asarray(y_train_pred))
     test_residual = np.abs(np.asarray(y_test) - np.asarray(y_test_pred))
@@ -1995,6 +2049,9 @@ def plot_ence_reliability(model_label: str, ence_df: pd.DataFrame, out_file: Pat
     plt.xlabel("Mean predicted sigma per bin")
     plt.ylabel("Observed RMSE per bin")
     save_plot(out_file)
+
+
+
 
 
 
