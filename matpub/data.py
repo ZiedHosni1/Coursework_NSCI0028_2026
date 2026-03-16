@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
+import os
 import re
+import sys
+import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +23,12 @@ from sklearn.preprocessing import OneHotEncoder, RobustScaler, StandardScaler
 
 from .config import RunConfig
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"No Pauling electronegativity for .*",
+    category=UserWarning,
+    module=r"pymatgen\.core\.periodic_table",
+)
 
 @dataclass
 class PreparedData:
@@ -48,6 +59,199 @@ def get_matminer_dataset_functions() -> tuple[Any, Any]:
 
     return _safe_get_available_datasets, load_dataset
 
+
+@contextlib.contextmanager
+def _silence_native_stderr(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        yield
+        return
+
+    dup_fd: int | None = None
+    try:
+        dup_fd = os.dup(stderr_fd)
+        with open(os.devnull, "w", encoding="utf-8") as sink:
+            os.dup2(sink.fileno(), stderr_fd)
+            yield
+    except Exception:
+        yield
+    finally:
+        if dup_fd is not None:
+            try:
+                os.dup2(dup_fd, stderr_fd)
+            except Exception:
+                pass
+            try:
+                os.close(dup_fd)
+            except Exception:
+                pass
+
+
+
+def _featurize_dataframe_with_progress(
+    df: pd.DataFrame,
+    featurizer: Any,
+    col_id: str,
+    logger: logging.Logger,
+    label: str,
+    chunk_size: int = 250,
+    silence_native_stderr: bool = False,
+) -> pd.DataFrame:
+    total = int(len(df))
+    if total == 0:
+        return df.copy()
+
+    chunk_size = max(1, int(chunk_size))
+    logger.info("Starting %s featurization on %d rows (chunk_size=%d).", label, total, chunk_size)
+    overall_start = time.perf_counter()
+    progress_row_step = max(chunk_size, max(1, total // 25))
+    progress_time_step = 15.0
+    last_logged_rows = 0
+    last_logged_elapsed = 0.0
+
+    if hasattr(featurizer, "set_n_jobs"):
+        try:
+            current_n_jobs = getattr(featurizer, "n_jobs", None)
+            if current_n_jobs != 1:
+                featurizer.set_n_jobs(1)
+                logger.info("%s featurizer n_jobs forced to 1 (was %s).", label, current_n_jobs)
+        except Exception:
+            pass
+    if hasattr(featurizer, "set_chunksize"):
+        try:
+            featurizer.set_chunksize(max(1, min(int(chunk_size), 32)))
+        except Exception:
+            pass
+
+    if total <= chunk_size:
+        with _silence_native_stderr(silence_native_stderr):
+            out = featurizer.featurize_dataframe(df.copy(), col_id=col_id, ignore_errors=True, pbar=False)
+        elapsed = time.perf_counter() - overall_start
+        logger.info("Finished %s featurization: %d/%d rows | elapsed=%.1fs.", label, total, total, elapsed)
+        return out
+
+    parts: list[pd.DataFrame] = []
+    for start in range(0, total, chunk_size):
+        stop = min(start + chunk_size, total)
+        chunk = df.iloc[start:stop].copy()
+        chunk_start = time.perf_counter()
+        with _silence_native_stderr(silence_native_stderr):
+            chunk_out = featurizer.featurize_dataframe(chunk, col_id=col_id, ignore_errors=True, pbar=False)
+        parts.append(chunk_out)
+        elapsed = time.perf_counter() - overall_start
+        chunk_seconds = time.perf_counter() - chunk_start
+        rows_done = stop
+        rows_left = max(0, total - rows_done)
+        rate = rows_done / max(elapsed, 1e-9)
+        eta_seconds = rows_left / max(rate, 1e-9)
+        should_log_progress = (
+            rows_done == total
+            or last_logged_rows == 0
+            or (rows_done - last_logged_rows) >= progress_row_step
+            or (elapsed - last_logged_elapsed) >= progress_time_step
+        )
+        if should_log_progress:
+            logger.info(
+                "%s featurization progress: %d/%d rows | last_chunk=%.1fs | elapsed=%.1fs | eta=%.1fs.",
+                label,
+                rows_done,
+                total,
+                chunk_seconds,
+                elapsed,
+                eta_seconds,
+            )
+            last_logged_rows = rows_done
+            last_logged_elapsed = elapsed
+
+    out = pd.concat(parts, axis=0)
+    out = out.loc[df.index]
+    total_elapsed = time.perf_counter() - overall_start
+    logger.info("Finished %s featurization: %d/%d rows | elapsed=%.1fs.", label, total, total, total_elapsed)
+    return out
+
+
+def _precheck_featurizer_rows(
+    df: pd.DataFrame,
+    featurizer: Any,
+    col_id: str,
+    logger: logging.Logger,
+    label: str,
+) -> tuple[pd.DataFrame, list[Any]]:
+    if not hasattr(featurizer, "precheck_dataframe"):
+        return df.copy(), []
+
+    logger.info("Running %s precheck on %d rows.", label, int(len(df)))
+    try:
+        precheck_input = df[[col_id]].copy().reset_index(drop=True)
+        precheck = featurizer.precheck_dataframe(precheck_input, col_id, return_frac=False, inplace=False)
+    except Exception as exc:
+        logger.warning("%s precheck failed; proceeding without precheck. Error: %s", label, exc)
+        return df.copy(), []
+
+    if isinstance(precheck, pd.DataFrame):
+        expected_col = f"{featurizer.__class__.__name__} precheck pass"
+        if expected_col in precheck.columns:
+            mask = pd.Series(precheck[expected_col].values, index=df.index)
+        else:
+            bool_cols = [c for c in precheck.columns if pd.api.types.is_bool_dtype(precheck[c])]
+            if not bool_cols:
+                bool_cols = [
+                    c
+                    for c in precheck.columns
+                    if bool(precheck[c].dropna().map(lambda x: isinstance(x, (bool, np.bool_))).all())
+                ]
+            if bool_cols:
+                mask = pd.Series(precheck[bool_cols[-1]].values, index=df.index)
+            else:
+                logger.warning(
+                    "%s precheck dataframe did not contain a boolean pass/fail column; proceeding without precheck.",
+                    label,
+                )
+                return df.copy(), []
+    elif isinstance(precheck, pd.Series):
+        mask = precheck.reindex(df.index)
+    elif isinstance(precheck, (list, tuple, np.ndarray)) and len(precheck) == len(df):
+        mask = pd.Series(precheck, index=df.index)
+    elif isinstance(precheck, (bool, np.bool_)):
+        mask = pd.Series([bool(precheck)] * len(df), index=df.index)
+    else:
+        logger.warning(
+            "%s precheck returned unsupported type %s; proceeding without precheck.",
+            label,
+            type(precheck).__name__,
+        )
+        return df.copy(), []
+
+    mask = mask.fillna(False).astype(bool)
+    skipped_rows = df.index[~mask].tolist()
+    supported = int(mask.sum())
+    skipped = int(len(df) - supported)
+    logger.info("%s precheck: %d/%d rows supported; %d skipped.", label, supported, int(len(df)), skipped)
+    if skipped_rows:
+        logger.warning(
+            "%s precheck skipped %d row(s). First skipped row indices: %s",
+            label,
+            skipped,
+            skipped_rows[:10],
+        )
+    return df.loc[mask].copy(), skipped_rows
+
+
+def _merge_featurized_subset(base_df: pd.DataFrame, featurized_subset: pd.DataFrame) -> pd.DataFrame:
+    if featurized_subset.empty:
+        return base_df.copy()
+
+    out = base_df.copy()
+    for col in featurized_subset.columns:
+        if col not in out.columns:
+            out[col] = np.nan
+    out.loc[featurized_subset.index, featurized_subset.columns.tolist()] = featurized_subset
+    return out
 
 def infer_task_type(target: pd.Series) -> str:
     if pd.api.types.is_numeric_dtype(target) and int(target.nunique(dropna=True)) > 20:
@@ -86,14 +290,33 @@ def _safe_nunique(series: pd.Series) -> int:
         return int(series.map(_safe_cell_to_text).astype("string").nunique(dropna=True))
 
 
-def _export_full_raw_dataset(df: pd.DataFrame, output_dir: Path, logger: logging.Logger) -> None:
-    raw_csv_frame = df.copy()
-    for col in raw_csv_frame.columns:
-        s = raw_csv_frame[col]
-        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s) or pd.api.types.is_datetime64_any_dtype(s) or pd.api.types.is_timedelta64_dtype(s):
+def make_csv_safe_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        s = out[col]
+        if (
+            pd.api.types.is_numeric_dtype(s)
+            or pd.api.types.is_bool_dtype(s)
+            or pd.api.types.is_datetime64_any_dtype(s)
+            or pd.api.types.is_timedelta64_dtype(s)
+        ):
             continue
-        raw_csv_frame[col] = s.map(_safe_cell_to_text)
-    raw_csv_frame.to_csv(output_dir / "dataset_raw_full.csv", index=False)
+        out[col] = s.map(_safe_cell_to_text)
+    return out
+
+
+def export_csv_safe(
+    df: pd.DataFrame,
+    path: Path,
+    *,
+    index: bool = False,
+    index_label: str | None = None,
+) -> None:
+    make_csv_safe_frame(df).to_csv(path, index=index, index_label=index_label)
+
+
+def _export_full_raw_dataset(df: pd.DataFrame, output_dir: Path, logger: logging.Logger) -> None:
+    export_csv_safe(df, output_dir / "dataset_raw_full.csv", index=False)
 
     try:
         df.to_pickle(output_dir / "dataset_raw_full.pkl")
@@ -339,6 +562,8 @@ def apply_matminer_featurizers(
     logger: logging.Logger,
     enabled: bool,
     memory: Memory | None,
+    composition_chunk_size: int = 1000,
+    structure_chunk_size: int = 50,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     info: dict[str, Any] = {
         "enabled": enabled,
@@ -346,18 +571,27 @@ def apply_matminer_featurizers(
         "composition_column": None,
         "structure_column": None,
         "generated_columns": [],
+        "row_failures": [],
+        "errors": [],
+        "skipped_featurizers": [],
     }
     if not enabled:
         return df, info
 
     if memory is None:
-        return _apply_matminer_featurizers_impl(df, logger, info)
+        return _apply_matminer_featurizers_impl(df, logger, info, composition_chunk_size, structure_chunk_size)
 
     cached = memory.cache(_apply_matminer_featurizers_impl)
-    return cached(df, logger, info)
+    return cached(df, logger, info, composition_chunk_size, structure_chunk_size)
 
 
-def _apply_matminer_featurizers_impl(df: pd.DataFrame, logger: logging.Logger, info: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _apply_matminer_featurizers_impl(
+    df: pd.DataFrame,
+    logger: logging.Logger,
+    info: dict[str, Any],
+    composition_chunk_size: int,
+    structure_chunk_size: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = df.copy()
     before = set(out.columns)
 
@@ -381,7 +615,7 @@ def _apply_matminer_featurizers_impl(df: pd.DataFrame, logger: logging.Logger, i
             from matminer.featurizers.composition import ElementProperty
 
             featurizer = ElementProperty.from_preset("magpie")
-            out = featurizer.featurize_dataframe(out, col_id=composition_col, ignore_errors=True, pbar=False)
+            out = _featurize_dataframe_with_progress(out, featurizer, composition_col, logger, "composition:ElementProperty", chunk_size=composition_chunk_size)
             info["applied"] = True
             logger.info("Applied ElementProperty featurizer on %s", composition_col)
         except Exception as exc:
@@ -393,9 +627,32 @@ def _apply_matminer_featurizers_impl(df: pd.DataFrame, logger: logging.Logger, i
             from matminer.featurizers.structure import DensityFeatures
 
             featurizer = DensityFeatures()
-            out = featurizer.featurize_dataframe(out, col_id=structure_col, ignore_errors=True, pbar=False)
-            info["applied"] = True
-            logger.info("Applied DensityFeatures featurizer on %s", structure_col)
+            work_df, skipped_rows = _precheck_featurizer_rows(out, featurizer, structure_col, logger, "structure:DensityFeatures")
+            for row_idx in skipped_rows:
+                info["row_failures"].append(
+                    {
+                        "row_index": row_idx,
+                        "stage": "structure",
+                        "featurizer": "DensityFeatures",
+                        "reason": "precheck_unsupported_row",
+                    }
+                )
+            if skipped_rows and not len(work_df):
+                info["skipped_featurizers"].append("structure:DensityFeatures:precheck_no_supported_rows")
+                logger.warning("Skipping DensityFeatures because no rows passed precheck.")
+            else:
+                featurized_subset = _featurize_dataframe_with_progress(
+                    work_df,
+                    featurizer,
+                    structure_col,
+                    logger,
+                    "structure:DensityFeatures",
+                    chunk_size=structure_chunk_size,
+                    silence_native_stderr=True,
+                )
+                out = _merge_featurized_subset(out, featurized_subset)
+                info["applied"] = True
+                logger.info("Applied DensityFeatures featurizer on %s", structure_col)
         except Exception as exc:
             logger.warning("Structure featurization failed: %s", exc)
 
@@ -1217,6 +1474,8 @@ def _apply_selected_matminer_featurizers(
     composition_featurizers: list[str],
     structure_featurizers: list[str],
     use_alloy_featurizer_precheck: bool = True,
+    composition_chunk_size: int = 1000,
+    structure_chunk_size: int = 50,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = df.copy()
     before = set(out.columns)
@@ -1230,6 +1489,60 @@ def _apply_selected_matminer_featurizers(
         "row_failures": [],
         "skipped_featurizers": [],
     }
+
+    density_key = "densityfeatures"
+    if structure_col and structure_col in out.columns:
+        for name in structure_featurizers:
+            if str(name).strip().lower() != density_key:
+                continue
+            try:
+                feat = _build_structure_featurizer(name)
+                before_cols = set(out.columns)
+                work_df, skipped_rows = _precheck_featurizer_rows(out, feat, structure_col, logger, f"structure:{name}")
+                for row_idx in skipped_rows:
+                    info["row_failures"].append(
+                        {
+                            "row_index": row_idx,
+                            "stage": "structure",
+                            "featurizer": str(name),
+                            "reason": "precheck_unsupported_row",
+                        }
+                    )
+                if skipped_rows and not len(work_df):
+                    info["skipped_featurizers"].append(f"structure:{name}:precheck_no_supported_rows")
+                    logger.warning("Skipping structure featurizer %s because no rows passed precheck.", name)
+                    continue
+
+                featurized_subset = _featurize_dataframe_with_progress(
+                    work_df,
+                    feat,
+                    structure_col,
+                    logger,
+                    f"structure:{name}",
+                    chunk_size=structure_chunk_size,
+                    silence_native_stderr=True,
+                )
+                out = _merge_featurized_subset(out, featurized_subset)
+                generated_cols = sorted(set(out.columns) - before_cols)
+
+                info["structure_featurizers"].append(name)
+                info["applied"] = True
+
+                if generated_cols:
+                    fail_mask = out.loc[work_df.index, generated_cols].isna().all(axis=1)
+                    if bool(fail_mask.any()):
+                        for row_idx in fail_mask.index[fail_mask].tolist():
+                            info["row_failures"].append(
+                                {
+                                    "row_index": row_idx,
+                                    "stage": "structure",
+                                    "featurizer": str(name),
+                                    "reason": "all_generated_features_nan",
+                                }
+                            )
+            except Exception as exc:
+                info["errors"].append(f"structure:{name}:{exc}")
+                logger.warning("Structure featurizer %s failed: %s", name, exc)
 
     if composition_col and composition_col in out.columns:
         for name in composition_featurizers:
@@ -1258,7 +1571,7 @@ def _apply_selected_matminer_featurizers(
                         continue
 
                 before_cols = set(out.columns)
-                out = feat.featurize_dataframe(out, col_id=composition_col, ignore_errors=True, pbar=False)
+                out = _featurize_dataframe_with_progress(out, feat, composition_col, logger, f"composition:{name}", chunk_size=composition_chunk_size)
                 generated_cols = sorted(set(out.columns) - before_cols)
 
                 info["composition_featurizers"].append(name)
@@ -1282,19 +1595,45 @@ def _apply_selected_matminer_featurizers(
 
     if structure_col and structure_col in out.columns:
         for name in structure_featurizers:
+            if str(name).strip().lower() == density_key:
+                continue
             try:
                 feat = _build_structure_featurizer(name)
                 before_cols = set(out.columns)
-                out = feat.featurize_dataframe(out, col_id=structure_col, ignore_errors=True, pbar=False)
+                work_df, skipped_rows = _precheck_featurizer_rows(out, feat, structure_col, logger, f"structure:{name}")
+                for row_idx in skipped_rows:
+                    info["row_failures"].append(
+                        {
+                            "row_index": row_idx,
+                            "stage": "structure",
+                            "featurizer": str(name),
+                            "reason": "precheck_unsupported_row",
+                        }
+                    )
+                if skipped_rows and not len(work_df):
+                    info["skipped_featurizers"].append(f"structure:{name}:precheck_no_supported_rows")
+                    logger.warning("Skipping structure featurizer %s because no rows passed precheck.", name)
+                    continue
+
+                featurized_subset = _featurize_dataframe_with_progress(
+                    work_df,
+                    feat,
+                    structure_col,
+                    logger,
+                    f"structure:{name}",
+                    chunk_size=structure_chunk_size,
+                    silence_native_stderr=True,
+                )
+                out = _merge_featurized_subset(out, featurized_subset)
                 generated_cols = sorted(set(out.columns) - before_cols)
 
                 info["structure_featurizers"].append(name)
                 info["applied"] = True
 
                 if generated_cols:
-                    fail_mask = out[generated_cols].isna().all(axis=1)
+                    fail_mask = out.loc[work_df.index, generated_cols].isna().all(axis=1)
                     if bool(fail_mask.any()):
-                        for row_idx in out.index[fail_mask].tolist():
+                        for row_idx in fail_mask.index[fail_mask].tolist():
                             info["row_failures"].append(
                                 {
                                     "row_index": row_idx,
@@ -1320,11 +1659,13 @@ def apply_dataset_profile_enrichment(
     enable_material_enrichment: bool,
     force_formula_core_featurizers: bool = True,
     use_alloy_featurizer_precheck: bool = True,
+    composition_chunk_size: int = 1000,
+    structure_chunk_size: int = 50,
 ) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
     if profile is None:
         matminer_info: dict[str, Any] = {}
         material_info: dict[str, Any] = {}
-        out, matminer_info = apply_matminer_featurizers(df, logger, enable_matminer, memory=None)
+        out, matminer_info = apply_matminer_featurizers(df, logger, enable_matminer, memory=None, composition_chunk_size=composition_chunk_size, structure_chunk_size=structure_chunk_size)
         out, material_info = enrich_material_descriptors(out, target_col, logger, memory=None, enabled=enable_material_enrichment)
         return out, matminer_info, material_info
 
@@ -1468,6 +1809,8 @@ def apply_dataset_profile_enrichment(
             composition_featurizers=comp_feats if use_comp else [],
             structure_featurizers=struct_feats if use_struct else [],
             use_alloy_featurizer_precheck=use_alloy_featurizer_precheck,
+            composition_chunk_size=composition_chunk_size,
+            structure_chunk_size=structure_chunk_size,
         )
     else:
         matminer_info = {"applied": False, "generated_columns": [], "row_failures": [], "errors": [], "skipped_featurizers": []}
@@ -1619,6 +1962,20 @@ def _drop_named_columns(df: pd.DataFrame, cols: list[str], target_col: str, logg
     if removed:
         logger.info("Dropped %s columns: %s", label, removed)
     return out, removed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

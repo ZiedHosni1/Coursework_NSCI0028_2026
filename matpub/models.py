@@ -943,8 +943,10 @@ def train_models(
     training_n_jobs = max(1, int(cfg.n_jobs))
 
     results: list[ModelResult] = []
+    total_models = int(len(definitions))
 
-    for definition in definitions:
+    for model_idx, definition in enumerate(definitions, start=1):
+        logger.info("Starting model %d/%d: %s", model_idx, total_models, definition.label)
         if task == "regression" and train_target_is_constant and definition.key != "baseline":
             logger.warning("Skipping %s because training target is constant.", definition.label)
             continue
@@ -1012,6 +1014,12 @@ def train_models(
         fit_params = _fit_params_for_current_estimator()
 
         start_cv = now_seconds()
+        logger.info(
+            "Starting cross-validation for %s | folds=%d | group_aware=%s",
+            definition.label,
+            int(cfg.cv_folds),
+            bool(isinstance(cv, GroupKFold)),
+        )
         cv_kwargs: dict[str, Any] = {
             "cv": cv,
             "scoring": scorer,
@@ -1081,6 +1089,7 @@ def train_models(
                 logger.warning("Cross-validation failed for %s; skipping model. Error: %s", definition.label, exc)
                 continue
         cv_seconds = now_seconds() - start_cv
+        logger.info("Finished cross-validation for %s | elapsed=%.2fs", definition.label, cv_seconds)
 
         cv_scores_raw = np.asarray(cv_result["test_score"], dtype=float)
         cv_scores = cv_scores_raw[np.isfinite(cv_scores_raw)]
@@ -1117,6 +1126,11 @@ def train_models(
                 verbose=0,
             )
             start_tune = now_seconds()
+            logger.info(
+                "Starting hyperparameter tuning for %s | iterations=%d",
+                definition.label,
+                int(n_iter),
+            )
             try:
                 if isinstance(cv, GroupKFold) and groups_train is not None:
                     if fit_params is not None:
@@ -1131,6 +1145,7 @@ def train_models(
                 tune_seconds = now_seconds() - start_tune
                 tuned_model = search.best_estimator_
                 best_params = search.best_params_
+                logger.info("Finished hyperparameter tuning for %s | elapsed=%.2fs", definition.label, tune_seconds)
             except Exception as exc:
                 tune_seconds = now_seconds() - start_tune
                 logger.warning("Hyperparameter tuning failed for %s; using untuned model. Error: %s", definition.label, exc)
@@ -1138,22 +1153,26 @@ def train_models(
                 best_params = None
 
         start_fit = now_seconds()
+        logger.info("Starting final fit for %s", definition.label)
         try:
             if fit_params is not None:
                 tuned_model.fit(X_train, y_train, **fit_params)
             else:
                 tuned_model.fit(X_train, y_train)
             fit_seconds = now_seconds() - start_fit
+            logger.info("Finished final fit for %s | elapsed=%.2fs", definition.label, fit_seconds)
         except Exception as exc:
             logger.warning("Skipping %s because final fit failed: %s", definition.label, exc)
             continue
 
         start_pred = now_seconds()
+        logger.info("Starting predictions for %s", definition.label)
         y_train_pred = tuned_model.predict(X_train)
         y_test_pred = tuned_model.predict(X_test)
         y_train_proba = tuned_model.predict_proba(X_train) if hasattr(tuned_model, "predict_proba") else None
         y_test_proba = tuned_model.predict_proba(X_test) if hasattr(tuned_model, "predict_proba") else None
         predict_seconds = now_seconds() - start_pred
+        logger.info("Finished predictions for %s | elapsed=%.2fs", definition.label, predict_seconds)
 
         if len(y_train_pred) != len(y_train) or len(y_test_pred) != len(y_test):
             raise RuntimeError(f"Prediction length mismatch for model {definition.label}.")
@@ -1181,6 +1200,8 @@ def train_models(
 
         nested_summary = None
         if not (task == "regression" and applied_transform is not None):
+            start_nested = now_seconds()
+            logger.info("Starting nested CV estimate for %s", definition.label)
             nested_summary = nested_cv_estimate(
                 definition.estimator,
                 preprocessor,
@@ -1191,7 +1212,14 @@ def train_models(
                 cfg,
                 groups_all,
             )
+            logger.info(
+                "Finished nested CV estimate for %s | elapsed=%.2fs",
+                definition.label,
+                now_seconds() - start_nested,
+            )
 
+        start_lc = now_seconds()
+        logger.info("Starting learning curve computation for %s", definition.label)
         lc_df = compute_learning_curve(
             tuned_model,
             X_train,
@@ -1202,6 +1230,11 @@ def train_models(
             random_state=cfg.random_state,
             groups=groups_train,
             use_group_aware=cfg.use_group_aware_cv,
+        )
+        logger.info(
+            "Finished learning curve computation for %s | elapsed=%.2fs",
+            definition.label,
+            now_seconds() - start_lc,
         )
         if lc_df.empty:
             logger.warning("Learning curve could not be computed for %s; continuing without it.", definition.label)

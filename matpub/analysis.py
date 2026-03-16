@@ -40,6 +40,21 @@ def _unwrap_pipeline(model: Any) -> Pipeline:
         return model.regressor
     return model
 
+def _unwrap_estimator_for_shap(estimator: Any) -> Any:
+    current = estimator
+    seen: set[int] = set()
+    while True:
+        if id(current) in seen:
+            return current
+        seen.add(id(current))
+        next_model = getattr(current, "model_", None)
+        if next_model is None:
+            next_model = getattr(current, "model", None)
+        if next_model is None or next_model is current:
+            return current
+        current = next_model
+
+
 
 def get_transformed_feature_names(model: Any, fallback: list[str]) -> np.ndarray:
     pipe = _unwrap_pipeline(model)
@@ -1364,8 +1379,9 @@ def run_feature_importance_and_shap(
     pipe = _unwrap_pipeline(model)
     pre = pipe.named_steps["preprocessor"]
     estimator = pipe.named_steps["model"]
+    shap_estimator = _unwrap_estimator_for_shap(estimator)
 
-    if estimator.__class__.__name__.lower().startswith("dummy"):
+    if shap_estimator.__class__.__name__.lower().startswith("dummy"):
         logger.info("Skipping SHAP for %s (dummy baseline model).", model_label)
         return
 
@@ -1388,11 +1404,11 @@ def run_feature_importance_and_shap(
     explain_df = pd.DataFrame(transformed, columns=feature_names)
 
     try:
-        explainer = shap.Explainer(estimator, transformed)
+        explainer = shap.Explainer(shap_estimator, transformed)
         shap_values = explainer(transformed)
     except Exception:
         try:
-            explainer = shap.TreeExplainer(estimator)
+            explainer = shap.TreeExplainer(shap_estimator)
             shap_values = explainer.shap_values(transformed)
         except Exception as exc:
             logger.warning("SHAP explainer failed for %s: %s", model_label, exc)

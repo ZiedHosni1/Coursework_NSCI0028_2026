@@ -25,7 +25,9 @@ class RunConfig:
     models: list[str] = field(default_factory=list)
     non_interactive: bool = False
     list_datasets: bool = False
+    all_datasets: bool = False
     dataset_config_file: str | None = None
+    max_samples: int | None = None
 
     random_state: int = 42
     test_size: float = 0.2
@@ -60,6 +62,8 @@ class RunConfig:
     shap_sample_size: int = 400
     max_shap_features: int = 1500
     learning_curve_points: int = 8
+    composition_progress_chunk_size: int = 1000
+    structure_progress_chunk_size: int = 50
 
     bootstrap_repeats: int = 200
     uncertainty_alphas: list[float] = field(default_factory=lambda: [0.32, 0.10, 0.05])
@@ -134,6 +138,7 @@ class RunConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Publication-grade materials ML workflow")
     parser.add_argument("--list-datasets", action="store_true")
+    parser.add_argument("--all-datasets", action="store_true")
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--target", type=str)
     parser.add_argument("--task", type=str, choices=["regression", "classification"])
@@ -141,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models", type=str, default="")
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--dataset-config-file", type=str, default="")
+    parser.add_argument("--max-samples", type=int, default=0)
 
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--test-size", type=float, default=0.2)
@@ -180,6 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shap-sample-size", type=int, default=400)
     parser.add_argument("--max-shap-features", type=int, default=1500)
     parser.add_argument("--learning-curve-points", type=int, default=8)
+    parser.add_argument("--composition-progress-chunk-size", type=int, default=1000)
+    parser.add_argument("--structure-progress-chunk-size", type=int, default=50)
 
     parser.add_argument("--bootstrap-repeats", type=int, default=200)
     parser.add_argument("--alphas", type=str, default="0.32,0.10,0.05")
@@ -262,7 +270,9 @@ def args_to_config(args: argparse.Namespace) -> RunConfig:
         models=parse_csv_arg(args.models),
         non_interactive=args.non_interactive,
         list_datasets=args.list_datasets,
+        all_datasets=args.all_datasets,
         dataset_config_file=args.dataset_config_file.strip() or None,
+        max_samples=(None if int(args.max_samples or 0) <= 0 else int(args.max_samples)),
         random_state=args.random_state,
         test_size=args.test_size,
         calibration_size=args.calibration_size,
@@ -289,6 +299,8 @@ def args_to_config(args: argparse.Namespace) -> RunConfig:
         shap_sample_size=args.shap_sample_size,
         max_shap_features=args.max_shap_features,
         learning_curve_points=args.learning_curve_points,
+        composition_progress_chunk_size=max(1, int(args.composition_progress_chunk_size)),
+        structure_progress_chunk_size=max(1, int(args.structure_progress_chunk_size)),
         bootstrap_repeats=args.bootstrap_repeats,
         uncertainty_alphas=[float(item) for item in parse_csv_arg(args.alphas)],
         enable_external_validation=not args.disable_external_validation,
@@ -340,6 +352,7 @@ def args_to_config(args: argparse.Namespace) -> RunConfig:
         use_cache=not args.no_cache,
         output_root=args.output_root,
     )
+
 
 
 

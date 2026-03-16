@@ -54,6 +54,14 @@ def _safe_reduce_matrix(matrix: Any, random_state: int, max_dim: int = 30) -> np
         return arr
     return PCA(n_components=max_dim, random_state=random_state).fit_transform(arr)
 
+def _unwrap_fitted_pipeline(model: Any) -> Pipeline:
+    if hasattr(model, "regressor_"):
+        return model.regressor_
+    if hasattr(model, "regressor"):
+        return model.regressor
+    return model
+
+
 
 def export_publication_tables(
     output_dir: Path,
@@ -186,11 +194,12 @@ def append_experiment_registry(
     return registry_path
 
 
-def _prepare_external_xy(df: pd.DataFrame, target: str, task: str, pipeline: Pipeline) -> tuple[pd.DataFrame, pd.Series] | None:
+def _prepare_external_xy(df: pd.DataFrame, target: str, task: str, pipeline: Any) -> tuple[pd.DataFrame, pd.Series] | None:
     if target not in df.columns:
         return None
 
-    pre = pipeline.named_steps["preprocessor"]
+    pipe = _unwrap_fitted_pipeline(pipeline)
+    pre = pipe.named_steps["preprocessor"]
     expected_cols = list(getattr(pre, "feature_names_in_", []))
     if not expected_cols:
         return None
@@ -400,7 +409,8 @@ def run_robustness_tests(
         X_miss = X_miss.mask(mask)
         rows.append(_score(f"missingness_{miss_level:.3f}", X_miss))
 
-    pre = best_pipeline.named_steps["preprocessor"]
+    pipe = _unwrap_fitted_pipeline(best_pipeline)
+    pre = pipe.named_steps["preprocessor"]
     train_repr = _safe_reduce_matrix(pre.transform(X_train), cfg.random_state, max_dim=30)
     test_repr = _safe_reduce_matrix(pre.transform(X_test), cfg.random_state, max_dim=30)
 

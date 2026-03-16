@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+import sys
 import time
 from datetime import datetime
+from dataclasses import replace
 import uuid
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from .dataset_profiles import get_dataset_config, resolve_target_specific_drops
 from .data import (
     apply_dataset_profile_enrichment,
     build_preprocessor,
+    export_csv_safe,
     detect_group_column,
     get_matminer_dataset_functions,
     infer_task_type,
@@ -77,7 +80,7 @@ def configure_logger(output_dir: Path) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     fh = logging.FileHandler(output_dir / "run.log", encoding="utf-8")
     fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
+    sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
 
     logger.addHandler(fh)
@@ -89,6 +92,37 @@ def make_output_dir(cfg: RunConfig, dataset: str, target: str) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"{sanitize_filename(dataset)}__{sanitize_filename(target)}__{cfg.run_mode}__{stamp}"
     return ensure_dir((Path(cfg.output_root) / name).resolve())
+
+
+def make_batch_output_dir(cfg: RunConfig) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"all_datasets__{cfg.run_mode}__{stamp}"
+    return ensure_dir((Path(cfg.output_root) / name).resolve())
+
+
+def _resolve_batch_target_from_profile(dataset: str, profile_file: str | None = None) -> str | None:
+    profile = get_dataset_config(dataset, external_config_file=profile_file)
+    if profile is None:
+        return None
+    target = str(profile.get("target_col") or "").strip()
+    return target or None
+
+
+def _configure_batch_logger(output_dir: Path) -> logging.Logger:
+    logger = logging.getLogger("matpub.batch")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh = logging.FileHandler(output_dir / "batch_run.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
 
 
 def prompt_choice(prompt: str, options: list[str], default_idx: int = 0) -> str:
@@ -157,10 +191,11 @@ def _load_or_compute_enriched_dataframe(
     df: pd.DataFrame,
     profile: dict[str, Any] | None,
     logger: logging.Logger,
+    sample_limit: int | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
     matminer_info: dict[str, Any] = {}
     material_info: dict[str, Any] = {}
-    cache_stage = f"enriched_{_profile_cache_tag(profile)}"
+    cache_stage = f"enriched_{_profile_cache_tag(profile)}__n{int(sample_limit) if sample_limit is not None else 'all'}"
 
     if cfg.use_cache:
         cache_file = _cache_file_path(cfg, dataset_name, target, cache_stage)
@@ -191,6 +226,8 @@ def _load_or_compute_enriched_dataframe(
         enable_material_enrichment=cfg.enable_material_descriptor_enrichment,
         force_formula_core_featurizers=cfg.force_formula_core_featurizers,
         use_alloy_featurizer_precheck=cfg.use_alloy_featurizer_precheck,
+        composition_chunk_size=cfg.composition_progress_chunk_size,
+        structure_chunk_size=cfg.structure_progress_chunk_size,
     )
 
     if cfg.use_cache:
@@ -602,9 +639,20 @@ def _save_preprocessed_dataset_snapshot(
 
 
 
+def _save_filtered_dataset_snapshot(
+    df: pd.DataFrame,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    export_csv_safe(df, output_dir / "dataset_after_filtering.csv", index=True, index_label="row_index")
+    logger.info("Saved filtered dataset snapshot: %d row(s).", int(len(df)))
+
+
+
 def _export_featurization_failure_rows(
     output_dir: Path,
     enrichment_info: dict[str, Any],
+    source_df: pd.DataFrame | None,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -634,7 +682,50 @@ def _export_featurization_failure_rows(
 
     frame = pd.DataFrame(rows, columns=["row_index", "stage", "featurizer", "reason"])
     frame.to_csv(output_dir / "featurization_failed_rows.csv", index=False)
+
+    precheck_frame = frame[frame["reason"].astype("string") == "precheck_unsupported_row"].copy()
+    precheck_frame.to_csv(output_dir / "featurization_precheck_failed_rows.csv", index=False)
+
+    error_rows: list[dict[str, Any]] = []
+    for raw_error in (enrichment_info.get("errors", []) if isinstance(enrichment_info, dict) else []):
+        text_error = str(raw_error)
+        parts = text_error.split(":", 2)
+        if len(parts) == 3:
+            stage, featurizer, error = parts
+        elif len(parts) == 2:
+            stage, featurizer = parts
+            error = ""
+        else:
+            stage, featurizer, error = "unknown", "unknown", text_error
+        error_rows.append(
+            {
+                "stage": stage,
+                "featurizer": featurizer,
+                "error": error,
+            }
+        )
+
+    error_frame = pd.DataFrame(error_rows, columns=["stage", "featurizer", "error"])
+    error_frame.to_csv(output_dir / "featurization_errors.csv", index=False)
+
+    structure_error_frame = error_frame[error_frame["stage"].astype("string") == "structure"].copy()
+    structure_error_frame.to_csv(output_dir / "structure_featurizer_errors.csv", index=False)
+
+    structure_failure_frame = frame[frame["stage"].astype("string") == "structure"].copy()
+    if source_df is not None and not structure_failure_frame.empty:
+        source_index_col = source_df.index.name or "index"
+        source_rows = source_df.reset_index().rename(columns={source_index_col: "row_index"})
+        structure_error_rows = structure_failure_frame.merge(source_rows, on="row_index", how="left")
+    else:
+        structure_error_rows = pd.DataFrame(
+            columns=list(structure_failure_frame.columns) + list(source_df.columns if source_df is not None else [])
+        )
+    export_csv_safe(structure_error_rows, output_dir / "structure_error_rows.csv", index=False)
+
     logger.info("Featurization failure rows exported: %d", int(len(frame)))
+    logger.info("Precheck failure rows exported: %d", int(len(precheck_frame)))
+    logger.info("Structure error rows exported: %d", int(len(structure_error_rows)))
+    logger.info("Structure featurizer errors exported: %d", int(len(structure_error_frame)))
     return frame
 
 
@@ -886,6 +977,18 @@ def _plot_bayesian_posterior_heatmap(frame: pd.DataFrame, out_file: Path) -> Non
     plt.title("Bayesian Correlated t-test: P(model_i better than model_j)")
     save_plot(out_file)
 
+
+def _limit_initial_samples(df: pd.DataFrame, max_samples: int | None) -> pd.DataFrame:
+    if max_samples is None:
+        return df
+
+    limit = int(max_samples)
+    if limit <= 0 or len(df) <= limit:
+        return df
+
+    return df.head(limit).copy()
+
+
 def run_pipeline(cfg: RunConfig) -> Path:
     sns.set_theme(style="white", rc={"axes.grid": False})
     get_available_datasets, load_dataset = get_matminer_dataset_functions()
@@ -924,11 +1027,14 @@ def run_pipeline(cfg: RunConfig) -> Path:
                 "Dataset download failed after 3 attempts due to a network/DNS issue while accessing matminer's Figshare host. "
                 f"Dataset={cfg.dataset!r}. Ensure internet/DNS/proxy access, or pre-download the dataset into the matminer datasets folder and rerun. "
                 f"Original error: {msg}"
-            ) from load_exc
+            )
         raise RuntimeError(f"Failed to load dataset {cfg.dataset!r}: {msg}") from load_exc
 
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
+
+    loaded_rows = int(len(df))
+    df = _limit_initial_samples(df, cfg.max_samples)
 
     profile_file = cfg.dataset_config_file
     if not profile_file:
@@ -1001,6 +1107,8 @@ def run_pipeline(cfg: RunConfig) -> Path:
     logger = configure_logger(output_dir)
 
     logger.info("Running pipeline | dataset=%s target=%s task=%s mode=%s", cfg.dataset, cfg.target, cfg.task, cfg.run_mode)
+    if cfg.max_samples is not None and int(len(df)) != loaded_rows:
+        logger.info("Applied initial sample limit: using first %d of %d rows.", int(len(df)), loaded_rows)
     if profile_file and dataset_profile is not None:
         logger.info("Using dataset profile from external config file: %s", profile_file)
     logger.info("Target selected: %s", cfg.target)
@@ -1023,6 +1131,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
         df,
         dataset_profile,
         logger,
+        sample_limit=cfg.max_samples,
     )
 
     featurization_info: dict[str, Any] = {}
@@ -1031,13 +1140,14 @@ def run_pipeline(cfg: RunConfig) -> Path:
     if isinstance(material_info, dict):
         for k, v in material_info.items():
             featurization_info.setdefault(k, v)
-    _export_featurization_failure_rows(output_dir, featurization_info, logger)
+    _export_featurization_failure_rows(output_dir, featurization_info, df, logger)
 
 
     X, y, numeric_cols, categorical_cols, dropped = prepare_features(enriched_df, cfg.target, cfg.task, cfg)
     X, y = _apply_target_outlier_cleaning(X, y, cfg.target, cfg.task, cfg, output_dir, logger)
     cfg.target_transform = _resolve_optional_target_transform(cfg.target_transform, y, logger)
     dropped.to_csv(output_dir / "dropped_features.csv", index=False)
+    _save_filtered_dataset_snapshot(df.loc[y.index].copy(), output_dir, logger)
     _save_preprocessed_dataset_snapshot(X, y, cfg.target, output_dir, logger)
 
     try:
@@ -1240,17 +1350,21 @@ def run_pipeline(cfg: RunConfig) -> Path:
         raise RuntimeError("Model metrics table is empty; aborting run.")
     table.to_csv(output_dir / "model_metrics.csv", index=False)
 
+    logger.info("Generating aggregate model comparison plots.")
     _plot_global_performance(table, cfg.task, output_dir / "model_performance_comparison.png", cfg.performance_plot_secondary_axis)
     _plot_runtime(table, output_dir / "model_runtime_comparison.png")
     _plot_cv_primary_with_errorbars(table, cfg.task, output_dir / "model_cv_primary_with_errorbars.png")
     _plot_metric_vs_runtime(table, cfg.task, output_dir / "model_metric_vs_runtime.png")
+    logger.info("Finished aggregate model comparison plots.")
 
     uncertainty_rows: list[pd.DataFrame] = []
     uncertainty_quality_map: dict[str, float] = {}
     model_summaries: list[dict[str, Any]] = []
     coverage_curves: list[tuple[str, pd.DataFrame]] = []
 
-    for result in model_results:
+    total_results = int(len(model_results))
+    for result_idx, result in enumerate(model_results, start=1):
+        logger.info("Starting post-training analysis for model %d/%d: %s", result_idx, total_results, result.label)
         if cfg.task == "regression":
             conf_df, doa_df, summary = analyze_regression_model(
                 cfg,
@@ -1284,6 +1398,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
             uncertainty_quality_map[result.key] = float(summary.get("mean_entropy", np.nan))
 
         model_summaries.append({"model": result.label, **summary})
+        logger.info("Finished post-training analysis for %s.", result.label)
 
     uncertainty_summary_df = pd.concat(uncertainty_rows, ignore_index=True) if uncertainty_rows else pd.DataFrame()
     if not uncertainty_summary_df.empty:
@@ -1291,15 +1406,21 @@ def run_pipeline(cfg: RunConfig) -> Path:
         plot_global_uncertainty_comparison(uncertainty_summary_df, output_dir / "uncertainty_comparison.png")
     _plot_global_error_rate_vs_significance(coverage_curves, output_dir / "error_rate_vs_significance_models.png")
 
+    logger.info("Starting multi-objective model ranking.")
     ranking_df = rank_models_multi_objective(model_results, cfg.task, uncertainty_quality_map)
     ranking_df.to_csv(output_dir / "multi_objective_ranking.csv", index=False)
+    logger.info("Finished multi-objective model ranking.")
 
+    logger.info("Starting statistical model comparison.")
     stats_df = statistical_model_comparison(cfg.task, model_results, y_test, cfg.bootstrap_repeats, cfg.random_state)
     stats_df.to_csv(output_dir / "model_statistical_comparison.csv", index=False)
+    logger.info("Finished statistical model comparison.")
 
+    logger.info("Starting permutation model comparison.")
     perm_df = permutation_model_comparison(cfg.task, model_results, y_test, cfg.permutation_test_repeats, cfg.random_state)
     perm_df.to_csv(output_dir / "model_permutation_comparison.csv", index=False)
     _plot_permutation_pvalue_heatmap(perm_df, output_dir / "model_permutation_pvalue_heatmap.png")
+    logger.info("Finished permutation model comparison.")
 
     if cfg.enable_bayesian_model_comparison:
         try:
@@ -1362,10 +1483,12 @@ def run_pipeline(cfg: RunConfig) -> Path:
         except Exception as exc:
             logger.warning("Leave-group protocols failed: %s", exc)
 
+    logger.info("Selecting and saving best model artifact.")
     best_model = choose_best_model(model_results, cfg.task)
     from joblib import dump
 
     dump(best_model.pipeline, output_dir / "best_model.joblib")
+    logger.info("Saved best model artifact: %s", best_model.label)
 
     if cfg.enable_ablation_study and cfg.run_mode == "complete":
         try:
@@ -1376,6 +1499,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
     external_validation_df = pd.DataFrame()
     if cfg.enable_external_validation and cfg.external_datasets:
         try:
+            logger.info("Starting external validation.")
             external_validation_df = run_external_validation(
                 cfg,
                 cfg.task,
@@ -1386,6 +1510,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
                 output_dir,
                 logger,
             )
+            logger.info("Finished external validation.")
         except Exception as exc:
             logger.warning("External validation failed: %s", exc)
 
@@ -1477,6 +1602,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
 
     checklist = {
         "Featurization failure rows exported": (output_dir / "featurization_failed_rows.csv").exists(),
+        "Precheck failure rows exported": (output_dir / "featurization_precheck_failed_rows.csv").exists(),
         "Train-only low-variance report exported": (output_dir / "low_variance_removed.csv").exists(),
         "Train-only high-correlation report exported": (output_dir / "high_correlation_removed.csv").exists(),
         "Feature-space shape report exported": (output_dir / "feature_space_shapes.csv").exists(),
@@ -1513,6 +1639,7 @@ def run_pipeline(cfg: RunConfig) -> Path:
         output_dir / "run_summary.json",
     )
 
+    logger.info("Generating HTML report.")
     report_path = generate_html_report(
         output_dir,
         table,
@@ -1523,8 +1650,10 @@ def run_pipeline(cfg: RunConfig) -> Path:
     logger.info("HTML report saved to %s", report_path)
 
     try:
+        logger.info("Exporting environment lock and artifact hashes.")
         export_environment_lock(output_dir)
         _ = compute_artifact_hashes(output_dir)
+        logger.info("Finished environment lock and artifact hashes export.")
     except Exception as exc:
         logger.warning("Environment lock / artifact hashes export failed: %s", exc)
 
@@ -1542,79 +1671,123 @@ def run_pipeline(cfg: RunConfig) -> Path:
     return output_dir
 
 
+def run_all_datasets(cfg: RunConfig) -> Path:
+    get_available_datasets, _ = get_matminer_dataset_functions()
+    datasets = sorted(get_available_datasets())
+    batch_dir = make_batch_output_dir(cfg)
+    logger = _configure_batch_logger(batch_dir)
+
+    logger.info(
+        "Running all-datasets batch mode | datasets=%d | mode=%s | max_samples=%s",
+        int(len(datasets)),
+        cfg.run_mode,
+        cfg.max_samples if cfg.max_samples is not None else "all",
+    )
+
+    rows: list[dict[str, Any]] = []
+    total = int(len(datasets))
+
+    for idx, dataset_name in enumerate(datasets, start=1):
+        profile_target = _resolve_batch_target_from_profile(dataset_name, cfg.dataset_config_file)
+        if profile_target is None:
+            logger.warning("Skipping %s (%d/%d): no profile target configured.", dataset_name, idx, total)
+            rows.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "skipped",
+                    "target": "",
+                    "task": "",
+                    "seconds": 0.0,
+                    "output_dir": "",
+                    "error_type": "",
+                    "reason": "no_profile_target",
+                }
+            )
+            continue
+
+        dataset_cfg = replace(
+            cfg,
+            dataset=dataset_name,
+            target=None,
+            list_datasets=False,
+            all_datasets=False,
+            non_interactive=True,
+        )
+        start = time.time()
+        logger.info("Batch run %d/%d | dataset=%s | profile_target=%s", idx, total, dataset_name, profile_target)
+        try:
+            run_output_dir = run_pipeline(dataset_cfg)
+            elapsed = float(time.time() - start)
+            logger.info("Batch run succeeded for %s | seconds=%.1f", dataset_name, elapsed)
+            rows.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "ok",
+                    "target": str(dataset_cfg.target or profile_target),
+                    "task": str(dataset_cfg.task or ""),
+                    "seconds": round(elapsed, 3),
+                    "output_dir": str(run_output_dir.resolve()),
+                    "error_type": "",
+                    "reason": "",
+                }
+            )
+        except Exception as exc:
+            elapsed = float(time.time() - start)
+            logger.warning("Batch run failed for %s | error=%s", dataset_name, exc)
+            rows.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "fail",
+                    "target": profile_target,
+                    "task": str(dataset_cfg.task or ""),
+                    "seconds": round(elapsed, 3),
+                    "output_dir": "",
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                }
+            )
+
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(batch_dir / "all_datasets_summary.csv", index=False)
+    counts = summary_df["status"].value_counts().to_dict() if not summary_df.empty else {}
+    save_json(
+        {
+            "datasets_total": total,
+            "ok": int(counts.get("ok", 0)),
+            "skipped": int(counts.get("skipped", 0)),
+            "failed": int(counts.get("fail", 0)),
+        },
+        batch_dir / "all_datasets_summary.json",
+    )
+    logger.info(
+        "All-datasets batch completed | ok=%d | skipped=%d | failed=%d",
+        int(counts.get("ok", 0)),
+        int(counts.get("skipped", 0)),
+        int(counts.get("fail", 0)),
+    )
+    for handler in list(logger.handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
+        logger.removeHandler(handler)
+    return batch_dir
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     cfg = args_to_config(args)
-    out_dir = run_pipeline(cfg)
+    if cfg.all_datasets and cfg.list_datasets:
+        raise ValueError("--all-datasets cannot be combined with --list-datasets")
+    if cfg.all_datasets and cfg.dataset is not None:
+        raise ValueError("--all-datasets cannot be combined with --dataset")
+    if cfg.all_datasets and cfg.target is not None:
+        raise ValueError("--all-datasets cannot be combined with --target; batch mode resolves dataset-specific targets from profiles")
+    out_dir = run_all_datasets(cfg) if cfg.all_datasets else run_pipeline(cfg)
     print(f"Artifacts saved to: {out_dir.resolve()}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
